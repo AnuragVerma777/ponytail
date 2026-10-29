@@ -11,10 +11,10 @@ import {
   addedLines,
   callsIn,
   defsIn,
-  duplicateOf,
   elapsed,
   fmtTokens,
   hits,
+  inProject,
   isCode,
   isSource,
   isTestCommand,
@@ -52,7 +52,6 @@ const EMPTY: Band = {
   transcript: '',
   reused: [],
   created: [],
-  dupes: [],
   removed: [],
   openCallers: [],
   tests: { state: 'none' },
@@ -69,7 +68,6 @@ const TASK = {
   model: '',
   reused: [],
   created: [],
-  dupes: [],
   removed: [],
   openCallers: [],
   tests: { state: 'none' as const },
@@ -266,6 +264,9 @@ export const register: Register = (on, options) => {
     if (e.tool !== 'Edit' && e.tool !== 'Write') return next(e)
 
     const file = e.file_path
+    // A scratch script outside the project is never reused or called by it (#1300).
+    const repo = await $.session.repo().catch(() => null)
+    if (!inProject(file, repo?.root ?? (await $.session.cwd()))) return next(e)
     const before = e.tool === 'Write' ? await $.fs.read(file).catch(() => '') : e.old_string
     const after = e.tool === 'Write' ? e.content : e.new_string
     const ran = await next(e)
@@ -276,16 +277,11 @@ export const register: Register = (on, options) => {
     const created = isSource(file) ? newDefs.filter(n => !oldDefs.includes(n)) : []
     const removed = oldDefs.filter(n => !newDefs.includes(n))
     const reused = isSource(file) ? callsIn(addedLines(before, after), known, newDefs) : []
-    const dupes = created.flatMap(name => {
-      const like = duplicateOf(name, file, known)
-      return like ? [{ name, like }] : []
-    })
 
     await update($, band, b => ({
       ...b,
       reused: union(b.reused, reused),
       created: union(b.created, created),
-      dupes: [...b.dupes, ...dupes.filter(d => !b.dupes.some(x => x.name === d.name))],
       removed: union(b.removed, removed),
       tests: isCode(file) && b.tests.state !== 'none' ? { ...b.tests, state: 'stale' as const } : b.tests,
     }))
@@ -398,8 +394,6 @@ export const register: Register = (on, options) => {
             ? 'no test since change'
             : ''
     const testsColor = b.tests.state === 'pass' ? 'success' : b.tests.state === 'fail' ? 'error' : undefined
-    const dupe = b.dupes[0]
-    const hasDupes = dupe !== undefined
     const hasOpen = b.openCallers.length > 0
 
     if (!b.details) {
@@ -413,7 +407,6 @@ export const register: Register = (on, options) => {
           {last !== undefined && <Text dimColor>last ${last.toFixed(2)}</Text>}
           <Text dimColor>{elapsed(b.busyMs)}</Text>
           {reuse !== undefined && <Text>{reuse}% reuse</Text>}
-          {hasDupes && <Text color="warning">{b.dupes.length} duplicate?</Text>}
           {hasOpen && <Text color="warning">⚠ {b.openCallers.length} callers open</Text>}
           {testsText !== '' && (
             <Text color={testsColor} dimColor={b.tests.state === 'stale'}>
@@ -432,18 +425,10 @@ export const register: Register = (on, options) => {
     // Only columns that say something; callers and tests appear once there is something to report.
     const cols: Col[] = [
       { key: 'cost', label: 'cost', value: `$${b.spent.toFixed(2)}`, sub: last === undefined ? '' : `last $${last.toFixed(2)} · ⌀ $${avg.toFixed(2)}` },
-      { key: 'tokens', label: 'tokens', value: fmtTokens(totalTokens(b.tokens)), sub: `${fmtTokens(b.tokens.output)} out · ${b.turns} ${b.turns === 1 ? 'turn' : 'turns'}` },
+      { key: 'tokens', label: 'tokens', value: fmtTokens(totalTokens(b.tokens)), sub: `${b.turns} ${b.turns === 1 ? 'turn' : 'turns'}` },
       { key: 'time', label: 'agent time', value: elapsed(b.busyMs), sub: b.turns > 0 ? `⌀ ${elapsed(b.busyMs / b.turns)} / turn` : '' },
     ]
-    if (b.reused.length + b.created.length > 0) {
-      cols.push({
-        key: 'reuse',
-        label: 'reuse',
-        value: reuse === undefined ? `${b.created.length} new` : `${reuse}%`,
-        sub: dupe ? `${dupe.name} ≈ ${dupe.like}` : reuse === undefined ? `${b.reused.length} reused` : `${b.reused.length} used · ${b.created.length} new`,
-        tone: hasDupes ? 'warning' : undefined,
-      })
-    }
+    if (reuse !== undefined) cols.push({ key: 'reuse', label: 'reuse', value: `${reuse}%`, sub: '' })
     if (hasOpen) {
       cols.push({ key: 'callers', label: 'callers', value: `${b.openCallers.length} open`, sub: b.openCallers.slice(0, 2).join(', '), tone: 'warning' })
     }
@@ -458,13 +443,14 @@ export const register: Register = (on, options) => {
     }
 
     let metrics = (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column">
         <Text dimColor wrap="truncate-end">
           {'─'.repeat(e.props.bodyColumns)}
         </Text>
         <Box flexDirection="row" gap={2}>
           {cols.map(c => (
-            <Box key={c.key} flexDirection="column" width={Math.max(10, Math.floor(e.props.bodyColumns / cols.length) - 2)}>
+            // Off the terminal the columns share the row; a width in cells would leave most of it empty and cut the text.
+            <Box key={c.key} flexDirection="column" {...(width === undefined ? { flexGrow: 1 } : { width: Math.max(10, Math.floor(width / cols.length) - 2) })}>
               <Text dimColor>{c.label}</Text>
               <Text bold color={c.tone}>
                 {c.value}
@@ -484,7 +470,8 @@ export const register: Register = (on, options) => {
     }
 
     return stack(
-      <Box flexDirection="column" gap={1} width={width}>
+      // The desktop's SVG draws its own line at the top, which would touch the buttons without the gap.
+      <Box flexDirection="column" width={width} gap={e.surface === 'desktop' ? 1 : 0}>
         <Box flexDirection="row" alignItems="center" gap={1}>
           {LEVELS.map(level => (
             <Button
